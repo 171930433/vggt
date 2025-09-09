@@ -353,7 +353,7 @@ def main():
 
     # Use the provided image folder path
     print(f"Loading images from {args.image_folder}...")
-    image_names = glob.glob(os.path.join(args.image_folder, "*"))
+    image_names = glob.glob(os.path.join(args.image_folder, "*.png"))
     print(f"Found {len(image_names)} images")
 
     images = load_and_preprocess_images(image_names).to(device)
