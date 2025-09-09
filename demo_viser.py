@@ -323,11 +323,11 @@ def main():
     Main function for the VGGT demo with viser for 3D visualization.
 
     This function:
-    1. Loads the VGGT model
-    2. Processes input images from the specified folder
-    3. Runs inference to generate 3D points and camera poses
-    4. Optionally applies sky segmentation to filter out sky points
-    5. Visualizes the results using viser
+    1. Checks if pre-computed predictions exist for the given image folder.
+    2. If predictions exist, it loads them directly.
+    3. If not, it loads the VGGT model, processes images, runs inference, and saves the predictions.
+    4. Optionally applies sky segmentation to filter out sky points.
+    5. Visualizes the results using viser.
 
     Command-line arguments:
     --image_folder: Path to folder containing input images
@@ -341,41 +341,103 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    print("Initializing and loading VGGT model...")
-    # model = VGGT.from_pretrained("facebook/VGGT-1B")
+    # --- 新增逻辑：定义预测结果的缓存文件路径 ---
+    # 我们将把结果保存在图片文件夹下的 'predictions.npz' 文件中
+    predictions_file = os.path.join(args.image_folder, "predictions.npz")
 
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    # 检查缓存文件是否存在
+    if os.path.exists(predictions_file):
+        # --- 新增逻辑：如果文件存在，直接加载 ---
+        print(f"发现已缓存的推理结果，从 {predictions_file} 加载...")
+        # 使用 np.load 加载 .npz 文件
+        predictions_data = np.load(predictions_file)
+        # 将加载的数据转换为一个标准的 Python 字典
+        predictions = {key: predictions_data[key] for key in predictions_data.files}
+        print("加载成功！")
 
-    model.eval()
-    model = model.to(device)
+        # 可视化依然需要原始图片，所以我们单独加载图片
+        print(f"正在加载图片用于可视化，来自 {args.image_folder}...")
+        image_names = sorted(glob.glob(os.path.join(args.image_folder, "*.png")))
+        images = load_and_preprocess_images(image_names).cpu().numpy()
+        predictions['images'] = images
 
-    # Use the provided image folder path
-    print(f"Loading images from {args.image_folder}...")
-    image_names = glob.glob(os.path.join(args.image_folder, "*.png"))
-    print(f"Found {len(image_names)} images")
+    else:
+        # --- 原始逻辑：如果文件不存在，则执行完整的推理流程 ---
+        print(f"未找到缓存结果，开始执行模型推理...")
+        
+        print("Initializing and loading VGGT model...")
+        model = VGGT()
+        _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+        model.eval()
+        model = model.to(device)
 
-    images = load_and_preprocess_images(image_names).to(device)
-    print(f"Preprocessed images shape: {images.shape}")
+        print(f"Loading images from {args.image_folder}...")
+        image_names = sorted(glob.glob(os.path.join(args.image_folder, "*.png")))
+        print(f"Found {len(image_names)} images")
+        images_tensor = load_and_preprocess_images(image_names).to(device)
+        print(f"Preprocessed images shape: {images_tensor.shape}")
 
-    print("Running inference...")
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        print("Running inference...")
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=dtype):
+                predictions = model(images_tensor)
 
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+        print("Converting pose encoding to extrinsic and intrinsic matrices...")
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images_tensor.shape[-2:])
+        predictions["extrinsic"] = extrinsic
+        predictions["intrinsic"] = intrinsic
 
-    print("Converting pose encoding to extrinsic and intrinsic matrices...")
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
-    predictions["extrinsic"] = extrinsic
-    predictions["intrinsic"] = intrinsic
+        # --- 这是最终修正后的代码 ---
 
-    print("Processing model outputs...")
-    for key in predictions.keys():
-        if isinstance(predictions[key], torch.Tensor):
-            predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+        # --- 这是最终修正后的代码 ---
 
+        print("Processing model outputs...")
+        # 对 predictions 字典进行一次彻底的转换，将其内部所有Tensor（包括在list/tuple里的）都转为Numpy
+        converted_predictions = {}
+        for key, value in predictions.items():
+            if isinstance(value, torch.Tensor):
+                # 情况1：值本身就是一个Tensor
+                # 注意：这里我们不再使用 squeeze(0)，因为 batch size 可能大于1
+                converted_predictions[key] = value.cpu().numpy()
+            elif isinstance(value, (list, tuple)):
+                # 情况2：值是一个列表或元组，需要遍历其内部元素
+                new_list = []
+                for item in value:
+                    if isinstance(item, torch.Tensor):
+                        new_list.append(item.cpu().numpy()) # 同样不使用 squeeze(0)
+                    else:
+                        new_list.append(item)
+                converted_predictions[key] = new_list
+            else:
+                # 情况3：其他类型的值，直接保留
+                converted_predictions[key] = value
+        # 用转换好的字典替换原来的字典
+        predictions = converted_predictions
+
+        # --- 现在 predictions 字典已经完全准备好了 ---
+
+        # 保存结果
+        print(f"推理完成，正在将结果保存到 {predictions_file}...")
+        # 注意：我们应该保存不带 squeeze 的版本
+        # squeeze(0) 会在 batch_size > 1 时报错，我们应该在循环里就去掉它
+        # 确保 predictions 字典里的每个 array 都没有被错误地 squeeze
+        save_dict = {}
+        for k, v in predictions.items():
+            if isinstance(v, np.ndarray) and v.shape[0] == 1 and len(v.shape) > 3: # 仅当batch=1时才squeeze
+                save_dict[k] = v.squeeze(0)
+            else:
+                save_dict[k] = v
+
+        np.savez_compressed(predictions_file, **save_dict)
+        print("保存成功！")
+
+        # 添加图片用于可视化 (直接转换，不squeeze)
+        predictions['images'] = images_tensor.cpu().numpy()
+
+
+    # --- 以下是共享逻辑，无论加载还是新推理，都会执行 ---
     if args.use_point_map:
         print("Visualizing 3D points from point map")
     else:
@@ -385,8 +447,7 @@ def main():
         print("Sky segmentation enabled - will filter out sky points")
 
     print("Starting viser visualization...")
-
-    viser_server = viser_wrapper(
+    viser_wrapper(
         predictions,
         port=args.port,
         init_conf_threshold=args.conf_threshold,
